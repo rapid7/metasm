@@ -25,12 +25,13 @@
 #
 
 require 'metasm'
+include Metasm
 require 'optparse'
 
 $VERBOSE = true
 
 # parse arguments
-opts = { :sc_cpu => 'Ia32' }
+opts = {}
 OptionParser.new { |opt|
 	opt.banner = 'Usage: disassemble-gtk.rb [options] <executable> [<entrypoints>]'
 	opt.on('--no-data-trace', 'do not backtrace memory read/write accesses') { opts[:nodatatrace] = true }
@@ -54,31 +55,42 @@ OptionParser.new { |opt|
 	opt.on('-A', '--disassemble-all-entrypoints') { opts[:dasm_all] = true }
 }.parse!(ARGV)
 
+opts[:sc_cpu] = eval(opts[:sc_cpu]) if opts[:sc_cpu] =~ /[.(\s:]/
+opts[:sc_cpu] = Metasm.const_get(opts[:sc_cpu]) if opts[:sc_cpu].kind_of?(::String)
+opts[:sc_cpu] = opts[:sc_cpu].new if opts[:sc_cpu].kind_of?(::Class)
+opts[:exe_fmt] = eval(opts[:exe_fmt]) if opts[:exe_fmt] =~ /[.(\s:]/
+
 case exename = ARGV.shift
 when /^live:(.*)/
 	t = $1
 	t = t.to_i if $1 =~ /^[0-9]+$/
-	os = Metasm::OS.current
+	os = OS.current
 	raise 'no such target' if not target = os.find_process(t) || os.create_process(t)
 	p target if $VERBOSE
-	w = Metasm::Gui::DbgWindow.new(target.debugger, "#{target.pid}:#{target.modules[0].path rescue nil} - metasm debugger")
+	w = Gui::DbgWindow.new(target.debugger, "#{target.pid}:#{target.modules[0].path rescue nil} - metasm debugger")
 	dbg = w.dbg_widget.dbg
+when /^emu:(.*)/
+	t = $1
+	exefmt = opts[:exe_fmt] || AutoExe.orshellcode { opts[:sc_cpu] || Ia32.new }
+	dbgexe = exefmt.decode_file(t)
+	dbgexe.cpu = opts[:sc_cpu] if opts[:sc_cpu]
+	dbg = EmuDebugger.new(dbgexe.disassembler)
+	w = Gui::DbgWindow.new(dbg, "emudbg")
 when /^(tcp:|udp:)?..+:/
-	dbg = Metasm::GdbRemoteDebugger.new(exename, opts[:sc_cpu])
-	w = Metasm::Gui::DbgWindow.new(dbg, "remote - metasm debugger")
+	dbg = GdbRemoteDebugger.new(exename, opts[:sc_cpu] || Ia32.new)
+	w = Gui::DbgWindow.new(dbg, "remote - metasm debugger")
 else
-	w = Metasm::Gui::DasmWindow.new("#{exename + ' - ' if exename}metasm disassembler")
+	w = Gui::DasmWindow.new("#{exename + ' - ' if exename}metasm disassembler")
 	if exename
-		opts[:sc_cpu] = eval(opts[:sc_cpu]) if opts[:sc_cpu] =~ /[.(\s:]/
-		opts[:exe_fmt] = eval(opts[:exe_fmt]) if opts[:exe_fmt] =~ /[.(\s:]/
-		exe = w.loadfile(exename, opts[:sc_cpu], opts[:exe_fmt])
+		exe = w.loadfile(exename, opts[:sc_cpu] || 'Ia32', opts[:exe_fmt])
+		exe.disassembler.cpu = exe.cpu = opts[:sc_cpu] if opts[:sc_cpu]
 		exe.disassembler.rebase(opts[:rebase]) if opts[:rebase]
 		if opts[:autoload]
 			basename = exename.sub(/\.\w\w?\w?$/, '')
 			opts[:map] ||= basename + '.map' if File.exist?(basename + '.map')
 			opts[:cheader] ||= basename + '.h' if File.exist?(basename + '.h')
 			(opts[:plugin] ||= []) << (basename + '.rb') if File.exist?(basename + '.rb')
-			opts[:session] ||= basename + '.metasm-session'
+			opts[:session] ||= basename + '.metasm-session' if File.exist?(basename + '.metasm-session')
 		end
 	end
 end
@@ -104,6 +116,10 @@ elsif dbg
 			puts "Error with plugin #{p}: #{$!.class} #{$!}"
 		end
 	}
+	if exename[0, 4] == 'emu:' and ep.first
+		dbg.pc = ep.first
+		w.dbg_widget.code.focus_addr dbg.pc
+	end
 end
 
 if dasm
@@ -139,5 +155,5 @@ end
 
 opts[:hookstr].to_a.each { |f| eval f }
 
-Metasm::Gui.main
+Gui.main
 

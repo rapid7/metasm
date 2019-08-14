@@ -99,7 +99,7 @@ class Decompiler
 
 		# [esp+8] => [:frameptr-12]
 		# TODO slow
-		makestackvars entry, myblocks.map { |b, to| @dasm.decoded[b].block }
+		makestackvars(entry, myblocks.map { |b, to| @dasm.decoded[b].block })
 
 		# find registry dependencies between blocks
 		deps = @dasm.cpu.decompile_func_finddeps(self, myblocks, func)
@@ -107,6 +107,10 @@ class Decompiler
 		scope = func.initializer = C::Block.new(@c_parser.toplevel)
 		if df = @dasm.function[entry]
 			scope.decompdata = df.decompdata ||= {:unalias_type => {}, :unalias_name => {}}
+			if df.noreturn
+				func.add_attribute('noreturn')
+				func.type.type = C::BaseType.new(:void)
+			end
 		else
 			scope.decompdata ||= {:unalias_type => {}, :unalias_name => {}}
 		end
@@ -140,7 +144,11 @@ class Decompiler
 		@dasm.cpu.decompile_check_abi(self, entry, func)
 
 		case ret = scope.statements.last
-		when C::CExpression; puts "no return at end of func" if $VERBOSE
+		when C::CExpression
+			if ret.op == :funcall and ret.lexpr.has_attribute('noreturn')
+			else
+				puts "no return at end of func" if $VERBOSE
+			end
 		when C::Return
 			if not ret.value
 				scope.statements.pop
@@ -368,6 +376,7 @@ class Decompiler
 		repl_bind = {}	# di => bt_bd
 
 		@dasm.cpu.decompile_makestackvars(@dasm, funcstart, blocks) { |block|
+			blockstart = block.address
 			block.list.each { |di|
 				bd = di.backtrace_binding ||= @dasm.cpu.get_backtrace_binding(di)
 				newbd = repl_bind[di] = {}
@@ -423,18 +432,18 @@ class Decompiler
 			p = C::CExpression[[p], itype]
 			C::CExpression[:*, p]
 		when ::Integer
-			C::CExpression[e]
+			C::CExpression[e, C::BaseType.new("__int#{@dasm.cpu.size}".to_sym)]
 		when C::CExpression
 			e
 		else
 			name = e.to_s
 			if not s = scope.symbol_ancestors[name]
 				s = C::Variable.new
-				s.type = C::BaseType.new(:__int32)
+				s.type = C::BaseType.new("__int#{@dasm.cpu.size}".to_sym)
 				case e
 				when ::String	# edata relocation (rel.length = size of pointer)
-					return @c_parser.toplevel.symbol[e] || new_global_var(e, itype || C::BaseType.new(:int), scope)
-				when ::Symbol; s.storage = :register ; s.add_attribute("register(#{name})")
+					return @c_parser.toplevel.symbol[e] || new_global_var(e, itype || s.type, scope)
+				when ::Symbol; s.add_attribute("register(#{name})")
 				else s.type.qualifier = [:volatile]
 					puts "decompile_cexpr unhandled #{e.inspect}, using #{e.to_s.inspect}" if $VERBOSE
 				end
@@ -571,9 +580,9 @@ class Decompiler
 				e
 			when C::Goto
 				if e.target == brk
-					C::Break.new
+					C::Break.new.with_misc(e.misc)
 				elsif e.target == cnt
-					C::Continue.new
+					C::Continue.new.with_misc(e.misc)
 				else e
 				end
 			else e
@@ -591,7 +600,7 @@ class Decompiler
 			}
 			walk(i.bthen.statements) { |sst| sst.outer = i.bthen.outer if sst.kind_of?(C::Block) and sst.outer == i.bthen }
 			scope.statements.concat i.bthen.statements
-			i.bthen = C::Break.new
+			i.bthen = C::Break.new.with_misc(i.misc)
 		end
 
 		patch_test = lambda { |ce|
@@ -631,7 +640,7 @@ class Decompiler
 					       ce.body = ce.body.statements.first
 				       when 0
 					       if ce.kind_of?(C::DoWhile) and i = ce.body.outer.statements.index(ce)
-						      ce = ce.body.outer.statements[i] = C::While.new(ce.test, ce.body)
+						      ce = ce.body.outer.statements[i] = C::While.new(ce.test, ce.body).with_misc(ce.misc)
 					       end
 					       ce.body = nil
 				       end
@@ -645,13 +654,13 @@ class Decompiler
 				i = ce.body.statements.last
 				if i.kind_of?(C::If) and not i.belse and i.bthen.kind_of?(C::Break)
 					ce.body.statements.pop
-					next C::DoWhile.new(i.test.negate, ce.body)
+					next C::DoWhile.new(i.test.negate, ce.body).with_misc(ce.misc)
 				end
 			end
 
 			# if (a) b = 1; else b = 2;  =>  b = a ? 1 : 2
 			if ce.kind_of?(C::If) and ce.belse.kind_of?(C::CExpression) and ce.belse.op == :'=' and ce.belse.lexpr.kind_of?(C::Variable) and ce.bthen.kind_of?(C::CExpression) and ce.bthen.op == :'=' and ce.bthen.lexpr == ce.belse.lexpr
-				next C::CExpression[ce.bthen.lexpr, :'=', [ce.test, :'?:', [ce.bthen.rexpr, ce.belse.rexpr]]]
+				next C::CExpression[ce.bthen.lexpr, :'=', [ce.test, :'?:', [ce.bthen.rexpr, ce.belse.rexpr]]].with_misc(ce.misc)
 			end
 		}
 
@@ -831,15 +840,15 @@ class Decompiler
 						ss.bthen.statements.pop
 						if l = ary[ssi+1] and l.kind_of?(C::Label)
 							ss.bthen.statements.grep(C::If).each { |it|
-								it.bthen = C::Break.new if it.bthen.kind_of?(C::Goto) and it.bthen.target == l.name
+								it.bthen = C::Break.new.with_misc(it.bthen.misc) if it.bthen.kind_of?(C::Goto) and it.bthen.target == l.name
 							}
 						end
-						ary[ssi] = C::While.new(ss.test, ss.bthen)
+						ary[ssi] = C::While.new(ss.test, ss.bthen).with_misc(ss.misc)
 					elsif ss.bthen.statements.last.kind_of?(C::Return) and gi = ((si+1)..ary.length).to_a.reverse.find { |_si| ary[_si].kind_of?(C::Goto) and ary[_si].target == s.name }
 						# l: if (a) { b; return; } c; goto l;  =>  while (!a) { c; } b; return;
 						wb = C::Block.new(scope)
 						wb.statements = decompile_cseq_while(ary[ssi+1...gi], wb)
-						w = C::While.new(C::CExpression.negate(ss.test), wb)
+						w = C::While.new(C::CExpression.negate(ss.test), wb).with_misc(ss)
 						ary[ssi..gi] = [w, *ss.bthen.statements]
 						finished = false ; break	#retry
 					end
@@ -848,7 +857,7 @@ class Decompiler
 					# l: a; goto l;  =>  while(1) { a; }
 					wb = C::Block.new(scope)
 					wb.statements = decompile_cseq_while(ary[si...gi], wb)
-					w = C::While.new(C::CExpression[1], wb)
+					w = C::While.new(C::CExpression[1], wb).with_misc(ary[gi].misc)
 					ary[si..gi] = [w]
 					finished = false ; break	#retry
 				end
@@ -861,10 +870,10 @@ class Decompiler
 					if g.bthen.kind_of?(C::Block) and g.bthen.statements.length > 1
 						nary = ary[si...gi] + [C::If.new(C::CExpression.negate(g.test), C::Break.new)] + g.bthen.statements[0...-1]
 						wb.statements = decompile_cseq_while(nary, wb)
-						w = C::DoWhile.new(C::CExpression[1], wb)
+						w = C::DoWhile.new(C::CExpression[1], wb).with_misc(g.misc)
 					else
 						wb.statements = decompile_cseq_while(ary[si...gi], wb)
-						w = C::DoWhile.new(g.test, wb)
+						w = C::DoWhile.new(g.test, wb).with_misc(g.misc)
 					end
 					ary[si..gi] = [w]
 					finished = false ; break	#retry
@@ -1001,10 +1010,18 @@ class Decompiler
 		vars = scope.symbol.values.sort_by { |v| walk_ce(funcalls) { |ce| break true if ce.rexpr == v } ? 0 : 1 }
 
 		# find the domains of var aliases
-		vars.each { |var| unalias_var(var, scope, g) }
+		vars.each { |var|
+			if unalias_var(var, scope, g)
+				if not var.stackoff or var.stackoff > 0	# dont allow local vars as args
+					func.type.args << var unless func.type.args.find { |aa| aa.name == var.name }
+					scope.statements.delete_if { |sm| sm.kind_of?(C::Declaration) and sm.var.name == var.name }
+				end
+			end
+		}
 	end
 
 	# duplicates a var per domain value
+	# return var if used before being set (eg func arg)
 	def unalias_var(var, scope, g = c_to_graph(scope))
 		# [label, index] of references to var (reading it, writing it, ro/wo it (eg eax = *eax => eax_0 = *eax_1))
 		read = {}
@@ -1023,8 +1040,8 @@ class Decompiler
 		g_exprs.each { |label, exprs|
 			exprs.each_with_index { |ce, i|
 				if ce_read(ce, var)
-					if (ce.op == :'=' and isvar(ce.lexpr, var) and not ce_write(ce.rexpr, var)) or
-					   (ce.op == :funcall and r and not ce_write(ce.lexpr, var) and not ce_write(ce.rexpr, var) and @dasm.cpu.abi_funcall[:changed].include?(r.to_sym))
+					if (ce.kind_of?(C::CExpression) and ce.op == :'=' and isvar(ce.lexpr, var) and not ce_write(ce.rexpr, var)) or
+					   (ce.kind_of?(C::CExpression) and ce.op == :funcall and r and not ce_write(ce.lexpr, var) and not ce_write(ce.rexpr, var) and @dasm.cpu.abi_funcall[:changed].include?(r.to_sym))
 						(ro[label] ||= []) << i
 						(wo[label] ||= []) << i
 						unchecked << [label, i, :up] << [label, i, :down]
@@ -1109,6 +1126,8 @@ class Decompiler
 			end
 		}
 
+		reach_func_top = false
+		n_i = 0
 		# check it out
 		while o = unchecked.shift
 			dom = []
@@ -1147,15 +1166,17 @@ class Decompiler
 
 			unchecked -= dom + dom_wo + dom_ro
 
-			next if func_top
+			if func_top
+				reach_func_top = true
+				next
+			end
 
 			# patch
-			n_i = 0
 			n_i += 1 while scope.symbol_ancestors[newvarname = "#{var.name}_a#{n_i}"]
 
 			nv = var.dup
 			nv.misc = var.misc ? var.misc.dup : {}
-			nv.storage = :register if nv.has_attribute_var('register')
+			#nv.storage = :register if nv.has_attribute_var('register')
 			nv.attributes = nv.attributes.dup if nv.attributes
 			nv.name = newvarname
 			nv.misc[:unalias_name] = newvarname
@@ -1191,6 +1212,8 @@ class Decompiler
 				nv.add_attribute('out')
 			end
 		end
+
+		reach_func_top
 	end
 
 	# revert the unaliasing namechange of vars where no alias subsists
@@ -1433,7 +1456,7 @@ class Decompiler
 				f = f.pointed if f.pointer?
 				next if not f.kind_of?(C::Function)
 				# cast func args to arg prototypes
-				f.args.to_a.zip(ce.rexpr).each_with_index { |(proto, arg), i| ce.rexpr[i] = C::CExpression[arg, proto.type] ; known_type[arg, proto.type] }
+				f.args.to_a.zip(ce.rexpr).each_with_index { |(proto, arg), i| if arg ; ce.rexpr[i] = C::CExpression[arg, proto.type] ; known_type[arg, proto.type] ; end }
 			elsif ce.op == :* and not ce.lexpr
 				if e = ce.rexpr and e.kind_of?(C::CExpression) and not e.op and e = e.rexpr and e.kind_of?(C::CExpression) and
 						e.op == :& and not e.lexpr and e.rexpr.kind_of?(C::Variable) and e.rexpr.stackoff
@@ -1582,7 +1605,7 @@ class Decompiler
 		walk_ce(scope) { |ce|
 			count_refs[ce.lexpr.name] += 1 if ce.lexpr.kind_of?(C::Variable)
 			count_refs[ce.rexpr.name] += 1 if ce.rexpr.kind_of?(C::Variable)
-			if is_cast[ce] and ce.rexpr.rexpr.kind_of?(C::Variable)
+			if is_cast[ce] and ce.type.pointer? and ce.rexpr.rexpr.kind_of?(C::Variable)
 				(uses[ce.rexpr.rexpr.name] ||= []) << ce.type.pointed
 			end
 		}
@@ -2039,6 +2062,7 @@ class Decompiler
 			when C::CExpression
 				@exprs[l_cur] = [stmt]
 				@to[l_cur] = [l_after]
+				@to[l_cur] = [] if stmt.op == :funcall and stmt.lexpr.has_attribute('noreturn')
 			when C::Return
 				@exprs[l_cur] = [stmt.value] if stmt.value
 				@to[l_cur] = []
@@ -2884,7 +2908,7 @@ class Decompiler
 		rename = lambda { |var, name|
 			var = var.rexpr if var.kind_of?(C::CExpression) and not var.op
 			next if not var.kind_of?(C::Variable) or not scope.symbol[var.name] or not name
-			next if (var.name !~ /^(var|arg)_/ and not var.storage == :register) or not scope.symbol[var.name] or name =~ /^(var|arg)_/
+			next if (var.name !~ /^(var|arg)_/ and not var.has_attribute_var('register')) or not scope.symbol[var.name] or name =~ /^(var|arg)_/
 			s = scope.symbol_ancestors
 			n = name
 			i = 0
