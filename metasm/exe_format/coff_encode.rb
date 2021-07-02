@@ -79,17 +79,18 @@ class COFF
 			rva = lambda { |n| Expression[label[n], :-, coff.label_at(coff.encoded, 0)] }
 			rva_end = lambda { |n| Expression[[label[n], :-, coff.label_at(coff.encoded, 0)], :+, edata[n].virtsize] }
 
+			exports = @exports || []
 			# ordinal base: smallest number > 1 to honor ordinals, minimize gaps
-			olist = @exports.map { |e| e.ordinal }.compact
+			olist = exports.map { |e| e.ordinal }.compact
 			# start with lowest ordinal, substract all exports unused to fill ordinal sequence gaps
 			omin = olist.min.to_i
 			gaps = olist.empty? ? 0 : olist.max+1 - olist.min - olist.length
-			noord = @exports.length - olist.length
+			noord = exports.length - olist.length
 			@ordinal_base ||= [omin - (noord - gaps), 1].max
 
 			@libname_p = rva['libname']
-			@num_exports = [@exports.length, @exports.map { |e| e.ordinal }.compact.max.to_i - @ordinal_base].max
-			@num_names = @exports.find_all { |e| e.name }.length
+			@num_exports = [exports.length, exports.map { |e| e.ordinal }.compact.max.to_i - @ordinal_base].max
+			@num_names = exports.find_all { |e| e.name }.length
 			@func_p = rva['addrtable']
 			@names_p = rva['namptable']
 			@ord_p = rva['ord_table']
@@ -98,8 +99,8 @@ class COFF
 
 			edata['libname'] << @libname << 0
 
-			elist = @exports.find_all { |e| e.name and not e.ordinal }.sort_by { |e| e.name }
-			@exports.find_all { |e| e.ordinal }.sort_by { |e| e.ordinal }.each { |e| elist.insert(e.ordinal-@ordinal_base, e) }
+			elist = exports.find_all { |e| e.name and not e.ordinal }.sort_by { |e| e.name }
+			exports.find_all { |e| e.ordinal }.sort_by { |e| e.ordinal }.each { |e| elist.insert(e.ordinal-@ordinal_base, e) }
 			elist.each { |e|
 				if not e
 					# export by ordinal with gaps
