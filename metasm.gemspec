@@ -16,6 +16,7 @@ Gem::Specification.new do |s|
   s.homepage      = 'http://metasm.cr0.org'
   s.license       = 'LGPL-2.1'
 
+  s.add_development_dependency "bundler", ">= 2.2.10"
   s.add_development_dependency "rake"
   s.add_development_dependency "test-unit"
 end
