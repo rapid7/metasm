@@ -1,0 +1,15 @@
+---
+info:
+  title: Metasm
+  description: This is a mirror of the mercurial repository for metasm
+  x-cortex-git:
+    github:
+      alias: r7org
+      repository: rapid7/metasm
+  x-cortex-tag: metasm
+  x-cortex-type: service
+  x-cortex-domain-parents:
+  - tag: metasploit
+openapi: 3.0.1
+servers:
+- url: "/"
