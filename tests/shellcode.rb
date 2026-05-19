@@ -35,7 +35,7 @@ class TestShellcode < Test::Unit::TestCase
 	end
 
 	def test_define_data_nil
-		assert_equal(Metasm::Shellcode.define_cstring(nil), '')
+		assert_equal(Metasm::Shellcode.define_data(nil), '')
 	end
 
 	def test_define_data_full_range
@@ -65,7 +65,7 @@ class TestShellcode < Test::Unit::TestCase
 	end
 
 	def test_define_cstring_nil
-		assert_equal(Metasm::Shellcode.define_cstring(nil), 'db, 0')
+		assert_equal(Metasm::Shellcode.define_cstring(nil), 'db 0')
 	end
 
 	def test_define_cstring_escape_quote
