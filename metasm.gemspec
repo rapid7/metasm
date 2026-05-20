@@ -1,10 +1,10 @@
-lib = File.expand_path('.', File.dirname(__FILE__))
+lib = File.expand_path('lib', File.dirname(__FILE__))
 $LOAD_PATH.unshift(lib) unless $LOAD_PATH.include?(lib)
-require 'metasm'
+require 'metasm/version'
 
 Gem::Specification.new do |s|
   s.name          = 'metasm'
-  s.version       = '1.0.6'
+  s.version       = Metasm::VERSION
   s.summary       =
     "Metasm is a cross-architecture assembler, disassembler, linker, and debugger."
   s.description   = ""
