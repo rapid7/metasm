@@ -57,6 +57,12 @@ extern VALUE *rb_eArgError __attribute__((import));
 #define DYNLDR_RUBY_19 #{RUBY_VERSION >= '1.9' ? 1 : 0}
 #endif
 
+// Ruby 3.2+ changed the RString/RArray struct layout (Variable Width Allocation).
+// len is now a direct field, and embedded string data starts after len (at the ptr offset).
+#ifndef DYNLDR_RUBY_32
+#define DYNLDR_RUBY_32 #{RUBY_VERSION >= '3.2' ? 1 : 0}
+#endif
+
 #if #{RUBY_VERSION >= '2.0' ? 1 : 0}
 // flonums. WHY?
 // also breaks Qtrue/Qnil
@@ -69,11 +75,24 @@ extern VALUE *rb_eArgError __attribute__((import));
  #define T_FIXNUM 0x15
  #define T_MASK   0x1f
  #define RSTRING_NOEMBED (1<<13)
- #define STR_PTR(o) ((RString(o)->flags & RSTRING_NOEMBED) ? RString(o)->ptr : (char*)&RString(o)->len)
- #define STR_LEN(o) ((RString(o)->flags & RSTRING_NOEMBED) ? RString(o)->len : (RString(o)->flags >> 14) & 0x1f)
+ #if DYNLDR_RUBY_32
+  // Ruby 3.2+: len is always a direct field; embedded string data starts at the ptr field offset
+  #define STR_PTR(o) ((RString(o)->flags & RSTRING_NOEMBED) ? RString(o)->ptr : (char*)&RString(o)->ptr)
+  #define STR_LEN(o) (RString(o)->len)
+ #else
+  // Ruby 1.9 - 3.1: embedded string data starts at the len field offset, length encoded in flags
+  #define STR_PTR(o) ((RString(o)->flags & RSTRING_NOEMBED) ? RString(o)->ptr : (char*)&RString(o)->len)
+  #define STR_LEN(o) ((RString(o)->flags & RSTRING_NOEMBED) ? RString(o)->len : (RString(o)->flags >> 14) & 0x1f)
+ #endif
  #define RARRAY_EMBED (1<<13)
- #define ARY_PTR(o) ((RArray(o)->flags & RARRAY_EMBED) ? (VALUE*)&RArray(o)->len : RArray(o)->ptr)
- #define ARY_LEN(o) ((RArray(o)->flags & RARRAY_EMBED) ? ((RArray(o)->flags >> 15) & 3) : RArray(o)->len)
+ #if DYNLDR_RUBY_32
+  // Ruby 3.2+: embedded array data starts at the len field offset (unchanged), but length uses more bits
+  #define ARY_PTR(o) ((RArray(o)->flags & RARRAY_EMBED) ? (VALUE*)&RArray(o)->len : RArray(o)->ptr)
+  #define ARY_LEN(o) ((RArray(o)->flags & RARRAY_EMBED) ? ((RArray(o)->flags >> 15) & 0x1f) : RArray(o)->len)
+ #else
+  #define ARY_PTR(o) ((RArray(o)->flags & RARRAY_EMBED) ? (VALUE*)&RArray(o)->len : RArray(o)->ptr)
+  #define ARY_LEN(o) ((RArray(o)->flags & RARRAY_EMBED) ? ((RArray(o)->flags >> 15) & 3) : RArray(o)->len)
+ #endif
 #else
  #define T_STRING 0x07
  #define T_ARRAY  0x09
