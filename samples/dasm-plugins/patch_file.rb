@@ -41,17 +41,15 @@ def reopen_rw(addr=nil, edata=nil)
 	end
 end
 
-raise "cant find original file" if not @program.filename or not File.exist? @program.filename
+raise "cant find original file" if not @program.filename or not File.exist?(@program.filename)
 
 reopen_rw
 
-def patch_instrs(addr, asmsrc)
-	sc = Metasm::Shellcode.new(cpu, addr)	# pfx needed for autorequire
-	sc.assemble(asmsrc, cpu)
-	sc.encoded.fixup! prog_binding	# allow references to dasm labels in the shellcode
-	raw = sc.encode_string
-
-	if s = get_section_at(addr) and s[0].data.kind_of? VirtualFile
+def patch_mem(addr, raw)
+	s = get_section_at(addr)
+	# remove relocs on rewritten range
+	raw.length.times { |i| s[0].reloc.delete s[0].ptr+i } if s
+	if s and s[0].data.kind_of?(VirtualFile)
 		s[0][s[0].ptr, raw.length] = raw
 	elsif o = addr_to_fileoff(addr)	# section too small, not loaded as a VirtFile
 		backup_program_file
@@ -60,7 +58,18 @@ def patch_instrs(addr, asmsrc)
 			fd.write raw
 		}
 		s[0][s[0].ptr, raw.length] = raw if s
-	else
+	end
+end
+
+def patch_instrs(addr, asmsrc, redasm = true)
+	sc = Metasm::Shellcode.new(cpu, addr)	# pfx needed for autorequire
+	sc.parse(asmsrc, cpu)
+	sc.encoded << sc.assemble_sequence(sc.source, sc.cpu, prog_binding, addr)
+	sc.encoded.fixup!(prog_binding)	# allow references to dasm labels in the shellcode
+	raw = sc.encode_string
+
+	if not patch_mem(addr, raw)
+		puts "patch_mem failed"
 		return
 	end
 
@@ -72,7 +81,7 @@ def patch_instrs(addr, asmsrc)
 		di.block.list.each { |ldi| @decoded.delete ldi.address }
 	}
 
-	disassemble_fast(addr) if b
+	disassemble_fast(addr) if b and redasm
 	if b and @decoded[addr]
 		nb = @decoded[addr].block
 		nb.from_normal = b.from_normal

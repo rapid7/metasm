@@ -129,11 +129,18 @@ class VirtualString
 		addr = 0
 		len = length
 		while len > @pagelength
-			ret << self[addr, @pagelength]
+			p = self[addr, @pagelength]
+			return ret if not p
+			ret << p
 			addr += @pagelength
 			len -= @pagelength
 		end
 		ret << self[addr, len]
+	end
+
+	# compat with String#b (force encoding binary)
+	def b
+		self
 	end
 
 	# alias to realstring

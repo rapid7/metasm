@@ -144,6 +144,14 @@ class Ia32
 				# fetch the relevant bytes from edata
 				bseq = edata.data[edata.ptr, op.bin.length].unpack('C*')
 
+				pfx_ = pfx
+				if fld = op.fields[:vex_w] and ((bseq[fld[0]] >> fld[1]) & @fields_mask[:vex_w]) == 1
+					# rex_w is used by opsz but only decoded in decode_instr_op
+					# add it here for checks with op.props[:opsz] (eg vmovd VS vmovq)
+					pfx_ = pfx.dup
+					pfx_[:rex_w] = true
+				end
+
 				# check against full opcode mask
 				op.bin.zip(bseq, op.bin_mask).all? { |b1, b2, m| b2 and ((b1 & m) == (b2 & m)) } and
 				# check special cases
@@ -155,8 +163,8 @@ class Ia32
 				  (op.props[:modrmA] and fld = op.fields[:modrm] and (bseq[fld[0]] >> fld[1]) & 0xC0 == 0xC0) or
 				  (op.props[:modrmR] and fld = op.fields[:modrm] and (bseq[fld[0]] >> fld[1]) & 0xC0 != 0xC0) or
 				  (fld = op.fields[:vex_vvvv] and @size != 64 and (bseq[fld[0]] >> fld[1]) & @fields_mask[:vex_vvvv] < 8) or
-				  (sz = op.props[:opsz] and opsz(di, op) != sz) or
-				  (sz = op.props[:adsz] and adsz(di, op) != sz) or
+				  (op.props[:opsz] and opsz(di, op, pfx_) != op.props[:opsz]) or
+				  (op.props[:adsz] and adsz(di, op) != op.props[:adsz]) or
 				  (ndpfx = op.props[:needpfx] and not pfx[:list].to_a.include? ndpfx) or
 				  (pfx[:adsz] and op.props[:adsz] and op.props[:adsz] == @size) or
 				  # return non-ambiguous opcode (eg push.i16 in 32bit mode) / sync with addop_post in opcode.rb
@@ -197,13 +205,23 @@ class Ia32
 			end
 		}
 
-		opsz = op.props[:argsz] || opsz(di)
+		opsz = opsz(di)
+		opsz = op.props[:argsz] if op.props[:argsz]
 		adsz = (pfx[:adsz] ? 48 - @size : @size)
 
 		mmxsz = ((op.props[:xmmx] && pfx[:opsz]) ? 128 : 64)
 		op.args.each { |a|
 			di.instruction.args << case a
 			when :reg;    Reg.new     field_val[a], opsz
+			when :modrm; ModRM.decode edata, field_val[:modrm], @endianness, adsz, opsz, pfx.delete(:seg)
+			when :i8, :u8, :u16; Expression[edata.decode_imm(a, @endianness)]
+			when :i;
+				if op.props[:unsigned_imm]
+					type = { 8 => :a8, 16 => :a16, 32 => :a32, 64 => :a64 }[opsz]
+				else
+					type = { 8 => :i8, 16 => :i16, 32 => :i32, 64 => :i64 }[opsz]
+				end
+				Expression[edata.decode_imm(type, @endianness)]
 			when :eeec;   CtrlReg.new field_val[a]
 			when :eeed;   DbgReg.new  field_val[a]
 			when :eeet;   TstReg.new  field_val[a]
@@ -214,11 +232,7 @@ class Ia32
 			when :regymm; SimdReg.new field_val[a], 256
 
 			when :farptr; Farptr.decode edata, @endianness, opsz
-			when :i8, :u8, :u16; Expression[edata.decode_imm(a, @endianness)]
-			when :i; Expression[edata.decode_imm("#{op.props[:unsigned_imm] ? 'a' : 'i'}#{opsz}".to_sym, @endianness)]
-
 			when :mrm_imm;  ModRM.decode edata, (adsz == 16 ? 6 : 5), @endianness, adsz, opsz, pfx.delete(:seg)
-			when :modrm; ModRM.decode edata, field_val[:modrm], @endianness, adsz, opsz, pfx.delete(:seg)
 			when :modrmmmx; ModRM.decode edata, field_val[:modrm], @endianness, adsz, mmxsz, pfx.delete(:seg), SimdReg, :argsz => op.props[:argsz]
 			when :modrmxmm; ModRM.decode edata, field_val[:modrm], @endianness, adsz, 128, pfx.delete(:seg), SimdReg, :argsz => op.props[:argsz], :mrmvex => op.props[:mrmvex]
 			when :modrmymm; ModRM.decode edata, field_val[:modrm], @endianness, adsz, 256, pfx.delete(:seg), SimdReg, :argsz => op.props[:argsz], :mrmvex => op.props[:mrmvex]
@@ -323,8 +337,8 @@ class Ia32
 		end
 	end
 
-	def opsz(di, op=nil)
-		if di and di.instruction.prefix and di.instruction.prefix[:opsz] and (op || di.opcode).props[:needpfx] != 0x66; 48-@size
+	def opsz(di, op=nil, pfx=di.instruction.prefix)
+		if di and pfx and pfx[:opsz] and (op || di.opcode).props[:needpfx] != 0x66; 48-@size
 		else @size
 		end
 	end
@@ -543,28 +557,26 @@ class Ia32
 					end
 				}
 			when 'div', 'idiv'; lambda { |di, a0|
-				# TODO idiv => signed
-				case opsz(di)
-				when 8
+				s = opsz(di)
+				m = mask[di]
+				if s == 8
 					src = Expression[eax, :&, 0xffff]
-					quot = Expression[[src, :/, a0], :&, 0xff]
-					rem  = Expression[[src, :%, a0], :&, 0xff]
+				else
+					src = Expression[[eax, :&, m], :|, [[edx, :&, m], :<<, s]]
+				end
+				quot = Expression[[src, :/, a0], :&, m]
+				rem  = Expression[[src, :%, a0], :&, m]
+				if op == 'idiv'
+					nquot = Expression[[1 << (2*s), :-, [[1 << (2*s), :-, src], :/, a0]], :&, m]
+					nrem  = Expression[[1 << (2*s), :-, [[1 << (2*s), :-, src], :%, a0]], :&, m]
+					sgn = Expression[[src, :>>, 2*s-1], :&, 1]
+					quot = Expression[[[1, :-, sgn], :*, quot], :|, [sgn, :*, nquot]]
+					rem  = Expression[[[1, :-, sgn], :*, rem ], :|, [sgn, :*, nrem ]]
+				end
+				if s == 8
 					{ Expression[eax, :&, 0xffff] => Expression[quot, :|, [rem, :<<, 8]] }
-				when 16
-					src = Expression[[eax, :&, 0xffff], :|, [[edx, :&, 0xffff], :<<, 16]]
-					quot = Expression[[src, :/, a0], :&, 0xffff]
-					rem  = Expression[[src, :%, a0], :&, 0xffff]
-					{ Expression[eax, :&, 0xffff] => quot, Expression[edx, :&, 0xffff] => rem }
-				when 32
-					src = Expression[[eax, :&, 0xffffffff], :|, [[edx, :&, 0xffffffff], :<<, 32]]
-					quot = Expression[[src, :/, a0], :&, 0xffffffff]
-					rem  = Expression[[src, :%, a0], :&, 0xffffffff]
-					{ Expression[eax, :&, 0xffffffff] => quot, Expression[edx, :&, 0xffffffff] => rem }
-				when 64
-					src = Expression[eax, :|, [edx, :<<, 64]]
-					quot = Expression[src, :/, a0]
-					rem  = Expression[src, :%, a0]
-					{ eax => quot, edx => rem }
+				else
+					{ Expression[eax, :&, m] => quot, Expression[edx, :&, m] => rem }
 				end
 			}
 			when 'rdtsc'; lambda { |di| { eax => Expression::Unknown, edx => Expression::Unknown, :incomplete_binding => Expression[1] } }
@@ -682,6 +694,7 @@ class Ia32
 					end
 				}
 			when 'movdqa', 'movdqu', 'movaps', 'movups'; lambda { |di, a0, a1| { a0 => Expression[a1] } }
+			when 'xorps'; lambda { |di, a0, a1| { a0 => Expression[a0, :^, a1] } }
 			when 'cmpxchg'; lambda { |di, a0, a1|	# eax == a0 ? a0 <= a1, zf <= 1 : eax <= a0, zf <= 0
 				eax_ = self.class::Reg.new(0, opsz(di)).symbolic
 				cmp = Expression[eax_, :==, a0]
@@ -799,8 +812,8 @@ class Ia32
 					end
 					val = bd.delete e
 					mask <<= shift if shift
-					invmask = mask ^ (@size == 64 ? 0xffff_ffff_ffff_ffff : 0xffff_ffff)
-					if invmask == 0xffff_ffff_0000_0000 and not di.opcode.props[:op32no64]
+					invmask = mask ^ -1
+					if invmask == (0xffff_ffff ^ -1) and not di.opcode.props[:op32no64]
 						bd[reg] = Expression[val, :&, 0xffff_ffff]
 					elsif invmask == 0
 						bd[reg] = val
@@ -897,8 +910,8 @@ class Ia32
 		bt_log.each { |btl|
 			next if btl[0] != :up
 			last = dasm.di_at(btl[4])
-			break if not last or last.block.to_normal.length > 2
-			next if last.block.to_normal.length != 2
+			break if not last or last.block.to_normal.to_a.length > 2
+			next if last.block.to_normal.to_a.length != 2
 			# search cmp eax, 42 ; ja too_big ; jmp [base+4*eax]
 			# XXX 256 cases switch => no cmp...
 			prelast = last.block.list.reverse.find { |pl| pl.opcode.name == 'cmp' }
@@ -924,6 +937,8 @@ class Ia32
 			# yay !
 			# include the symbolic dest for backtrace stuff
 			puts "found jmptable for #{Expression[di.address]} #{di.instruction} (#{index_max+1} entries)" if $VERBOSE
+			# limit in case we get very large range
+			index_max = 16384 if index_max > 16384
 			# TODO add labels / tables / xrefs etc
 			[Expression[arg0]] + (0..index_max).map { |i| expr.bind(index => i) }
 		end

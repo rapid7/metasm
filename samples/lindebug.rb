@@ -696,6 +696,20 @@ class LinDebug
 		@command['syscall'] = lambda { |str|
 			@dbg.syscall_wait(str)
 		}
+		@command['dump'] =
+		@command['memdump'] = lambda { |str|
+			addr, len, fname = str.strip.split(/\s+/, 3)
+			addr = @dbg.resolve(addr)
+			len = @dbg.resolve(len)
+			fname ||= "memdump_#{Metasm::Expression[addr]}_#{Metasm::Expression[len]}.raw"
+			raw = @dbg[addr, len].to_str
+			if raw.empty?
+				log 'nothing to dump'
+			else
+				File.open(fname, 'wb') { |fd| fd.write raw }
+				log "saved #{fname}"
+			end
+		}
 	end
 end
 
@@ -705,10 +719,17 @@ if $0 == __FILE__
 	opts = {}
 	OptionParser.new { |opt|
 		opt.on('-m map', '--map filemap') { |f| opts[:filemap] = f }
+		opt.on('-e env=value', '--env key=value') { |f| k, v = f.split('=', 2) ; ENV[k] = v }
 		opt.on('--cpu cpu') { |c| opts[:sc_cpu] = c }
 	}.parse!(ARGV)
 
 	case ARGV.first
+	when /^live:(.*)/
+		t = $1
+		t = t.to_i if $1 =~ /^[0-9]+$/
+		os = Metasm::OS.current
+		raise 'no such target' if not target = os.find_process(t) || os.create_process(t)
+		dbg = target.debugger
 	when /^emu:(.*)/
 		exepath = $1
 		opts[:sc_cpu] = eval(opts[:sc_cpu]) if opts[:sc_cpu] =~ /[.(\s:]/

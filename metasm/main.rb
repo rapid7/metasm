@@ -158,7 +158,7 @@ module Backtrace
 	def self.backtrace_str(ary)
 		return '' if not ary
 		i = ary.length
-		bt = ''
+		bt = +''
 		while i > 0
 			bt << ",\n\tincluded from " if ary[i]
 			i -= 2
@@ -342,7 +342,7 @@ class Expression < ExpressionType
 	INT_MIN = {}
 	INT_MAX = {}
 
-	[8, 16, 32, 64].each { |sz|
+	[8, 16, 32, 64, 128, 256].each { |sz|
 		INT_SIZE["i#{sz}".to_sym] =
 		INT_SIZE["u#{sz}".to_sym] =
 		INT_SIZE["a#{sz}".to_sym] = sz
@@ -432,7 +432,8 @@ class Expression < ExpressionType
 
 	# make it useable as Hash key (see +==+)
 	def hash
-		(@lexpr.hash + @op.hash + @rexpr.hash) & 0x7fff_ffff
+		# :'(
+		((@lexpr.respond_to?(:hash) ? @lexpr.hash : @lexpr.object_id) + @op.object_id + (@rexpr.respond_to?(:hash) ? @rexpr.hash : @rexpr.object_id)) & 0x7fff_ffff
 	end
 	alias eql? ==
 
@@ -1007,16 +1008,11 @@ class EncodedData
 	attr_reader   :ptr	# custom writer
 	def ptr=(p) @ptr = @export[p] || p end
 
-	INITIAL_DATA = ''
-	INITIAL_DATA.force_encoding('BINARY') if INITIAL_DATA.respond_to?(:force_encoding)
+	INITIAL_DATA = ''.b
 
 	# opts' keys in :reloc, :export, :virtsize, defaults to empty/empty/data.length
 	def initialize(data=INITIAL_DATA.dup, opts={})
-		if data.respond_to?(:force_encoding) and data.encoding.name != 'ASCII-8BIT' and data.length > 0
-			puts "Forcing edata.data.encoding = BINARY at", caller if $DEBUG
-			data = data.dup.force_encoding('binary')
-		end
-		@data     = data
+		@data     = data.b
 		@reloc    = opts[:reloc]    || {}
 		@export   = opts[:export]   || {}
 		@inv_export = @export.invert
@@ -1166,11 +1162,8 @@ class EncodedData
 			@virtsize += other.virtsize
 		else
 			fill
-			if other.respond_to?(:force_encoding) and other.encoding.name != 'ASCII-8BIT' and other.length > 0
-				puts "Forcing edata.data.encoding = BINARY at", caller if $DEBUG
-				other = other.dup.force_encoding('binary')
-			end
-			if @data.empty?; @data = other.dup
+			other = other.b if other.kind_of?(String)
+			if @data.empty?; @data = other
 			elsif other.empty?
 			elsif not @data.kind_of?(String); @data = @data.to_str << other
 			else @data << other

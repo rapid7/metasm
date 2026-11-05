@@ -489,6 +489,134 @@ class Disassembler
 		@program.fileoff_to_addr(foff)
 	end
 
+	# find the innermost asm loop including addr (single function)
+	# ctx[:exclude] is a hash { to => [from] }
+	#  this function will ignore all direct paths [from, to] when working (can be used to find not innermost loop) ; from is a block start address
+	# returns [block_start_addrs] or nil if no loop is found
+	def find_block_loop(addr, ctx={})
+		return if not di = di_at(addr) or not di.block
+		start = di.block.address
+		# { to => from } with block start addrs
+		path = {}
+		# [addr]
+		todo = [start]
+		while cur = todo.shift
+			block_at(cur).each_to_samefunc(self) { |to|
+				next if ctx[:exclude] and ctx[:exclude][to].to_a.include?(cur)
+				todo << to
+				path[to] ||= cur
+			}
+			break if path[start]
+		end
+		return if not last = path[start]
+
+		list = [last]
+		while last != start
+			last = path[last]
+			list << last
+		end
+		list.reverse
+	end
+
+	# from a list of block addrs, find all samefunc block links from something outside of the list to one of the blocks of the list
+	# return [[from_addr, block_addr]]
+	def find_block_list_entry(blocks)
+		entry = []
+		blocks.each { |ba|
+			block_at(ba).each_from_samefunc(self) { |from|
+				if not di = di_at(from) or not blocks.include?(di.block.address)
+					entry << [from, ba]
+				end
+			}
+		}
+		entry
+	end
+
+	# match a pattern of basic blocks layout
+	# given a block pattern ("a -> b -> c \n a -> c"), check if the block at address addr matches it
+	# checks only the links between blocks, not their content
+	# returns the first match or nil
+	# a match is a hash { 'pattern label name' => block address } ({ eg 'a' => 0x12345, 'b' => 0x12346 })
+	# if no match, return an empty array
+	# the first label in the pattern is bound to addr
+	# additional links are not allowed, unless the node is included in extern_from (other block allowed to link to it) or extern_to
+	# if a block is given, is called for candidates matches; block shall return true if acceptable
+	# multiple pattern names may point to the same block if it satisfies the pattern
+	def block_pattern_match(addr, pattern, extern_from=nil, extern_to=nil, &cb)
+		return if not block_at(addr)
+		addr = block_at(addr).address
+
+		# node -> [list of to]
+		pat_to = {}
+		# node -> [list of from]
+		pat_from = {}
+		root = nil
+		pattern.gsub(';', "\n").scan(/^.*$/) { |l|
+			a = l.split(/->/).map { |s| s.strip }
+			a.each_with_index { |n, i|
+				root ||= n
+				pat_to[n] ||= []
+				pat_from[n] ||= []
+				next if not a[i+1]
+				pat_to[n] |= [a[i+1]]
+				pat_from[a[i+1]] ||= []
+				pat_from[a[i+1]] |= [n]
+			}
+		}
+		# default for extern_from: all roots of the pattern
+		extern_from ||= pat_from.keys.find_all { |n| pat_from[n].empty? }
+		# default for extern_to: all leaves
+		extern_to ||= pat_to.keys.find_all { |n| pat_to[n].empty? }
+
+		# [cur_match]
+		todo = [{root => addr}]
+		while cur = todo.shift
+			# drop if any node is not acceptable
+			next if cur.find { |n, a|
+				b = block_at(a)
+				next true if not b
+				# check 'to' wrt pattern
+				to = b.to_samefunc(self)
+				next true if to.length < pat_to[n].length
+				next true if to.length > pat_to[n].length and not extern_to.include?(n)
+				# ensure all pat_to that we assigned are all in to
+				next true if (pat_to[n].map { |nt| cur[nt] }.compact - to).first
+				# check 'from' (ensure we use the block's address and not of the instr's)
+				from = b.from_samefunc(self).map { |fa| block_at(fa) ? block_at(fa).address : fa }
+				next true if from.length < pat_from[n].length
+				next true if from.length > pat_from[n].length and not extern_from.include?(n)
+				next true if (pat_from[n].map { |nf| cur[nf] }.compact - from).first
+			}
+			next if cb and not cb[cur]	# callback
+			if cur.length == pat_to.length
+				# success
+				return cur
+			end
+			# build next level
+			# add a single new association (keep complex checks up here ^)
+			cur.each { |n, a|
+				b = block_at(a)
+				if nt = pat_to[n].find { |_nt| !cur[_nt] }
+					to = b.to_samefunc(self)
+					# prefer not already assigned addresses
+					seen = pat_to[n].map { |_nt| cur[_nt] }.compact
+					((to - seen) + (to & seen)).each { |at|
+						todo << cur.merge(nt => at)
+					}
+					break
+				end
+				if nf = pat_from[n].find { |_nf| !cur[_nf] }
+					from = b.from_samefunc(self).map { |fa| block_at(fa) ? block_at(fa).address : fa }
+					seen = pat_from[n].map { |_nf| cur[_nf] }.compact
+					((from - seen) + (from & seen)).each { |af|
+						todo << cur.merge(nf => af)
+					}
+					break
+				end
+			}
+		end
+	end
+
 	# remove the decodedinstruction from..to, replace them by the new Instructions in 'by'
 	# this updates the block list structure, old di will still be visible in @decoded, except from original block (those are deleted)
 	# if from..to spans multiple blocks
@@ -516,7 +644,7 @@ class Disassembler
 		ldi = by.last
 		ldi = DecodedInstruction.new(ldi) if ldi.kind_of? Instruction
 		nb_i = by.grep(Instruction).length
-		wantlen = nb_i if wantlen < 0 or (ldi and ldi.opcode.props[:setip])
+		wantlen = nb_i if wantlen < 0
 		if patch_by
 			by.map! { |di|
 				if di.kind_of? Instruction
@@ -568,8 +696,12 @@ class Disassembler
 			end
 			@decoded[di.address] = di
 		}
-		@addrs_done.delete_if { |ad| normalize(ad[0]) == tb.address or ad[1] == tb.address }
-		@addrs_done.delete_if { |ad| normalize(ad[0]) == fb.address or ad[1] == fb.address } if by.empty? and tb.address != fb.address
+		@addrs_done.delete tb.address
+		@addrs_done.values.each { |v| v.delete_if { |d| d[:from] == tb.address } }
+		if by.empty? and tb.address != fb.address
+			@addrs_done.delete fb.address
+			@addrs_done.values.each { |v| v.delete_if { |d| d[:from] == fb.address } }
+		end
 
 		# update to_normal/from_normal
 		fb.to_normal = tb.to_normal
@@ -649,7 +781,7 @@ class Disassembler
 				true if x.empty?
 			end
 		}
-		@addrs_done.delete_if { |ad| !(addrs & [normalize(ad[0]), normalize(ad[1])]).empty? }
+		@addrs_done.clear
 	end
 
 	# merge two instruction blocks if they form a simple chain and are adjacent
@@ -670,7 +802,7 @@ class Disassembler
 			b1.to_subfuncret = b2.to_subfuncret
 			b1.to_indirect = b2.to_indirect
 			b2.list.clear
-			@addrs_done.delete_if { |ad| normalize(ad[0]) == b2.address }
+			@addrs_done.delete b2.address
 			true
 		end
 	end
@@ -703,6 +835,8 @@ class Disassembler
 			end
 
 			b = @decoded[addr].block
+			# keep a ref to the di, for postprocessing (rip-relative addressing...)
+			b.list.each { |di| di.instruction.instance_variable_set("@di", di) }
 			ret.concat b.list.map { |di| di.instruction }
 
 			b.each_to_otherfunc(self) { |to|
@@ -715,8 +849,14 @@ class Disassembler
 			}
 
 			if not di = b.list[-1-@cpu.delay_slot] or not di.opcode.props[:stopexec] or di.opcode.props[:saveip]
-				to = b.list.last.next_addr
-				if todo.include?(to) and di_at(to)
+				# the current block falls through the end, ensure it falls to the right place
+				tmp = b.to_subfuncret || b.to_normal
+				if tmp and tmp.length == 1
+					to = tmp[0]
+				else
+					to = b.list.last.next_addr rescue nil
+				end
+				if (todo.include?(to) or done.include?(to)) and di_at(to)
 					if done.include?(to)
 						if not to_l = inv_binding[to]
 							to_l = auto_label_at(to, 'loc')
@@ -729,6 +869,7 @@ class Disassembler
 						todo << to	# ensure it's next in the listing
 					end
 				else
+					puts "flatten +halt after #{to.inspect} (following #{di})"
 					ret << @cpu.instr_jump_stop
 				end
 			end
@@ -1260,13 +1401,32 @@ class Disassembler
 				a.map! { |e| fix[e] }
 			when Hash
 				tmp = {}
-				a.each { |k, v| tmp[fix[k]] = v }
+				a.each { |k, v| tmp[fix[k]] = fix[v] }
 				a.replace tmp
 			when Integer
 				a += delta
 			when BacktraceTrace
 				a.origin = fix[a.origin]
 				a.address = fix[a.address]
+			when DecodedInstruction
+				di = a
+				fix[di.block] if di.block_head?
+				di.address = fix[di.address]
+				di.next_addr = fix[di.next_addr]
+			when InstructionBlock
+				a.address = fix[a.address]
+				fix[a.to_normal]
+				fix[a.to_subfuncret]
+				fix[a.to_indirect]
+				fix[a.from_normal]
+				fix[a.from_subfuncret]
+				fix[a.from_indirect]
+				fix[a.backtracked_for]
+			when DecodedFunction
+				a.return_address = fix[a.return_address]
+				fix[a.backtracked_for]
+			when Xref
+				xr.origin = fix[xr.origin]
 			end
 			a
 		}
@@ -1278,31 +1438,21 @@ class Disassembler
 		fix[@addrs_todo]
 		fix[@addrs_done]
 		fix[@comment]
-		@prog_binding.each_key { |k| @prog_binding[k] = fix[@prog_binding[k]] }
-		@old_prog_binding.each_key { |k| @old_prog_binding[k] = fix[@old_prog_binding[k]] }
+		fix[@prog_binding]
+		fix[@old_prog_binding]
 		@label_alias_cache = nil
 
-		@decoded.values.grep(DecodedInstruction).each { |di|
-			if di.block_head?
-				b = di.block
-				b.address += delta
-				fix[b.to_normal]
-				fix[b.to_subfuncret]
-				fix[b.to_indirect]
-				fix[b.from_normal]
-				fix[b.from_subfuncret]
-				fix[b.from_indirect]
-				fix[b.backtracked_for]
-			end
-			di.address = fix[di.address]
-			di.next_addr = fix[di.next_addr]
-		}
-		@function.each_value { |f|
-			f.return_address = fix[f.return_address]
-			fix[f.backtracked_for]
-		}
-		@xrefs.values.flatten.compact.each { |x| x.origin = fix[x.origin] }
 		delta
+	end
+
+	# backtrace, ignoring final unknown/indirection
+	# if the result is one value, return it, else return nil
+	def backtrace_one(*args)
+		ret = backtrace(*args)
+		ret.delete_if { |v| v == Expression::Unknown or Expression[v].reduce_rec.kind_of?(Indirection) }
+		if ret.length == 1 and ret.first.kind_of?(Expression)
+			normalize(ret.first)
+		end
 	end
 
 	# dataflow method

@@ -58,7 +58,8 @@ module Metasm
 		'Debugger' => 'debug',
 		'LinOS' => 'os/linux', 'WinOS' => 'os/windows',
 		'GdbClient' => 'os/gdbremote',
-		'EmuDebugger' => 'os/emulator',
+		'EmuDebugger' => 'os/emulator', 'SymEmuDebugger' => 'os/emulator',
+		'PhysMemX64' => 'os/physmem',
 		'Disassembler' => 'disassemble',
 		'Decompiler' => 'decompile',
 		'DynLdr' => 'dynldr',
@@ -88,5 +89,15 @@ if Hash.new.respond_to?(:key)
 		alias index_premetasm index rescue nil
 		undef index rescue nil
 		alias index key
+	end
+end
+
+# not sure when String#b was actually introduced
+if not String.new.respond_to?(:b)
+	puts "using ruby1.9 workaround for String#b" if $DEBUG
+	class String
+		def b
+			dup.force_encoding(Encoding::BINARY)
+		end
 	end
 end

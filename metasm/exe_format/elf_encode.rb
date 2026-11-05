@@ -62,8 +62,7 @@ class ELF
 			return if name_p and sne.data[@name_p, @name.length+1] == @name+0.chr
 			return if @name_p = sne.data.index(@name+0.chr)
 			@name_p = sne.virtsize
-			@name.force_encoding('BINARY') if name.respond_to?(:force_encoding)
-			sne << @name << 0
+			sne << @name.b << 0
 		end
 	end
 
@@ -93,8 +92,7 @@ class ELF
 			return if name_p and s[@name_p, @name.length+1] == @name+0.chr
 			return if @name_p = s.index(@name+0.chr)
 			@name_p = strtab.length
-			@name.force_encoding('BINARY') if name.respond_to?(:force_encoding)
-			strtab << @name << 0
+			strtab << @name.b << 0
 		end
 	end
 
@@ -489,6 +487,7 @@ class ELF
 
 	# encodes the .dynamic section, creates .hash/.gnu.hash/.rel/.rela/.dynsym/.strtab/.init,*_array as needed
 	def encode_segments_dynamic
+		return if @header.shnum == 0	# .nointerp
 		if not strtab = @sections.find { |s| s.type == 'STRTAB' and s.flags.include? 'ALLOC' }
 			strtab = Section.new
 			strtab.name = '.dynstr'
@@ -521,8 +520,7 @@ class ELF
 		add_str = lambda { |n|
 			if n and n != '' and not ret = strtab.encoded.data.index(n + 0.chr)
 				ret = strtab.encoded.virtsize
-				n.force_encoding('BINARY') if n.respond_to?(:force_encoding)
-				strtab.encoded << n << 0
+				strtab.encoded << n.b << 0
 			end
 			ret || 0
 		}
@@ -924,7 +922,7 @@ class ELF
 
 		# ensure last PT_LOAD is writeable (used for bss)
 		seg = loadsegs.last
-		if not seg or not seg.flags.include? 'W'
+		if (not seg or not seg.flags.include? 'W') and @header.shnum != 0
 			seg = Segment.new
 			seg.type = 'LOAD'
 			seg.flags = ['R', 'W']
@@ -956,7 +954,7 @@ class ELF
 			first_seg.filesz = new_label('segfilsz')
 		end
 
-		if first_seg and not @segments.find { |seg_| seg_.type == 'PHDR' }
+		if first_seg and not @segments.find { |seg_| seg_.type == 'PHDR' } and @header.shnum != 0
 			phdr = Segment.new
 			phdr.type = 'PHDR'
 			phdr.flags = first_seg.flags

@@ -82,18 +82,21 @@ class AsmListingWidget < DrawableWidget
 
 	def mouse_wheel(dir, x, y)
 		case dir
-		when :up
+		when :up; move = -4
+		when :down; move = 4
+		when Integer; move = dir
+		else return
+		end
+		if move < 0
 			# TODO handle block start (multiline) / data aggregation (db 100h dup(?), strings..)
 			@wantaddr = @line_address[@caret_y]
-			adjust_startaddr(-1, false)
-			adjust_startaddr(-1, false)
-			adjust_startaddr(-1, false)
+			(-move - 1).times { adjust_startaddr(-1, false) }
 			adjust_startaddr(-1)
-		when :down
+		elsif move > 0
 			# scroll down 4 lines, or more if all the 4 1st lines have the same addr (eg block start)
 			@wantaddr = @line_address[@caret_y]
-			a = @line_address[4..-1].find { |v| v != @line_address[0] } if @line_address[4]
-			@startaddr = a || (@startaddr + 4)
+			a = @line_address[move..-1].find { |v| v != @line_address[0] } if @line_address[move]
+			@startaddr = a || (@startaddr + move)
 			adjust_startaddr
 		end
 	end
@@ -469,6 +472,14 @@ class AsmListingWidget < DrawableWidget
 					nl[]
 				else
 					curaddr += [di.bin_length, 1].max
+
+					if di.block.list.last == di and @dasm.di_at(curaddr) and not di.block.to_normal.to_a.include?(curaddr) and not di.block.to_subfuncret.to_a.include?(curaddr) and
+						# kikoo delayslot
+						not di.block.list[-[4, di.block.list.length].min, 4].reverse.find { |_di| _di.opcode.props[:stopexec] and not _di.opcode.props[:saveip] }
+						curaddr = di.address
+						nl[]
+						curaddr += [di.bin_length, 1].max
+					end
 				end
 			elsif s = @dasm.get_edata_at(curaddr) and s.ptr < s.length
 				@dasm.comment[curaddr].each { |c| str_c << ["// #{c}", :comment] ; nl[] } if @dasm.comment[curaddr]
@@ -553,7 +564,7 @@ class AsmListingWidget < DrawableWidget
 					else
 						len = [len, s.length-s.ptr].min
 						len -= curaddr % 256 if len == 256 and curaddr.kind_of? Integer
-						len = (1..len).find { |l| @dasm.xrefs[curaddr+l] or s.inv_export[s.ptr+l] or s.reloc[s.ptr+l] } || len
+						len = (1..len).find { |l| @dasm.xrefs[curaddr+l] or s.inv_export[s.ptr+l] or s.reloc[s.ptr+l] or @dasm.decoded[curaddr+l]} || len
 						dat = "db #{Expression[len]} dup(?) "
 						aoff = len
 					end

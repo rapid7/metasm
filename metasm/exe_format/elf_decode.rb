@@ -420,7 +420,7 @@ class ELF
 	def decode_sections_symbols
 		@symbols ||= []
 		@sections.to_a.each { |sec|
-			next if sec.type != 'SYMTAB'
+			next if sec.type != 'SYMTAB' and sec.type != 'DYNSYM'
 			next if not strtab = @sections[sec.link]
 			strtab = @encoded[strtab.offset, strtab.size].data
 			@encoded.ptr = sec.offset
@@ -816,6 +816,35 @@ class ELF
 		Metasm::Relocation.new(Expression[target], :u64, @endianness) if target
 	end
 
+	def decode_notes(off = nil, len = nil)
+		if not off
+			if s = @segments.find { |s_| s_.type == 'NOTE' }
+				# this way it also works with LoadedELF
+				off = addr_to_off(s.vaddr) || s.offset
+				len ||= s.filesz
+			elsif s = @sections.find { |s_| s_.type == 'NOTE' }
+				# if no DYNAMIC segment, assume we decode an ET_REL from file
+				off = s.offset
+				len ||= s.size
+			end
+		end
+		return if not @encoded.ptr = off
+		len ||= @encoded.length - @encoded.ptr
+
+		@note = []
+		while @encoded.ptr < off+len
+			namesz = decode_word
+			descsz = decode_word
+			type = decode_word
+			name = @encoded.read(namesz).chomp(0.chr)
+			@encoded.ptr += 4 - ((namesz-1) % 4) - 1	# name padded to next numeric field alignment
+			descr = @encoded.read(descsz)
+			@encoded.ptr += 4 - ((descsz-1) % 4) - 1	# ^
+
+			@note << [name, type, descr]
+		end
+	end
+
 	class DwarfDebug
 		# decode a DWARF2 'compilation unit'
 		def decode(elf, info, abbrev, str)
@@ -1094,6 +1123,12 @@ class ELF
 		decode_segments_relocs_interpret
 	end
 
+	# decode coredump file elements
+	def decode_core
+		decode_segments
+		decode_notes
+	end
+
 	# decodes the dynamic segment, fills segments.encoded
 	def decode_segments
 		decode_segments_dynamic
@@ -1122,12 +1157,6 @@ class ELF
 		decode_sections_symbols
 		decode_sections_relocs
 		@sections.each { |s|
-			case s.type
-			when 'PROGBITS', 'NOBITS'
-			when 'TODO'	# TODO
-			end
-		}
-		@sections.find_all { |s| s.type == 'PROGBITS' or s.type == 'NOBITS' }.each { |s|
 			if s.flags.include? 'ALLOC'
 				if s.type == 'NOBITS'
 					s.encoded = EncodedData.new '', :virtsize => s.size
@@ -1149,7 +1178,7 @@ class ELF
 		case @header.type
 		when 'DYN', 'EXEC'; decode_segments
 		when 'REL'; decode_sections
-		when 'CORE'
+		when 'CORE'; decode_core
 		end
 	end
 
@@ -1171,7 +1200,7 @@ class ELF
 		case @header.machine
 		when 'X86_64'; X86_64.new
 		when '386'; Ia32.new
-		when 'MIPS'; (@header.flags.include?('32BITMODE') ? MIPS64 : MIPS).new(@endianness)
+		when 'MIPS'; (bitsize == 64 ? MIPS64 : MIPS).new(@endianness)
 		when 'PPC'; PPC.new
 		when 'ARM'; ARM.new
 		when 'AARCH64'; AArch64.new
@@ -1279,7 +1308,7 @@ EOC
 
 	# returns an array of [name, addr, length, info]
 	def section_info
-		if @sections
+		if @sections and @sections.length > 1
 			@sections[1..-1].map { |s|
 				[s.name, s.addr, s.size, s.flags.join(',')]
 			}

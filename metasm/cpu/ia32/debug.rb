@@ -23,7 +23,13 @@ class Ia32
 	end
 
 	def dbg_register_size
-		@dbg_register_size ||= Hash.new(32).update(:cs => 16, :ds => 16, :es => 16, :fs => 16, :gs => 16)
+		@dbg_register_size ||= dbg_register_size_initialize(Hash.new(32))
+	end
+
+	def dbg_register_size_initialize(h=Hash.new(32))
+		[:cs, :ds, :es, :fs, :gs].each { |r| h[r] = 16 }
+		16.times { |i| h["ymm#{i}".to_sym] = 256 }
+		h
 	end
 
 	def dbg_flag_list
@@ -32,16 +38,29 @@ class Ia32
 
 	DBG_FLAGS = { :c => 0, :p => 2, :a => 4, :z => 6, :s => 7, :t => 8, :i => 9, :d => 10, :o => 11 }
 	def dbg_get_flag(dbg, f)
-		(dbg.get_reg_value(dbg_register_flags) >> DBG_FLAGS[f]) & 1
+		fl = dbg.get_reg_value(dbg_register_flags)
+		if fl.kind_of?(::Integer)
+			(fl >> DBG_FLAGS[f]) & 1
+		else
+			Expression[[fl, :>>, DBG_FLAGS[f]], :&, 1].reduce
+		end
 	end
 	def dbg_set_flag(dbg, f)
 		fl = dbg.get_reg_value(dbg_register_flags)
-		fl |= 1 << DBG_FLAGS[f]
+		if fl.kind_of?(::Integer)
+			fl |= 1 << DBG_FLAGS[f]
+		else
+			fl = Expression[fl, :|, [1, :<<, DBG_FLAGS[f]]].reduce
+		end
 		dbg.set_reg_value(dbg_register_flags, fl)
 	end
 	def dbg_unset_flag(dbg, f)
 		fl = dbg.get_reg_value(dbg_register_flags)
-		fl &= ~(1 << DBG_FLAGS[f])
+		if fl.kind_of?(::Integer)
+			fl &= ~(1 << DBG_FLAGS[f])
+		else
+			fl = Expression[fl, :&, [:~, [1, :<<, DBG_FLAGS[f]]]].reduce
+		end
 		dbg.set_reg_value(dbg_register_flags, fl)
 	end
 
@@ -66,8 +85,7 @@ class Ia32
 		end
 	end
 
-	DBG_BPX = "\xcc"
-	DBG_BPX.force_encoding('BINARY') if DBG_BPX.respond_to?(:force_encoding)
+	DBG_BPX = "\xcc".b
 	def dbg_enable_bpx(dbg, bp)
 		bp.internal[:previous] ||= dbg.memory[bp.address, 1]
 		dbg.memory[bp.address, 1] = DBG_BPX
@@ -229,11 +247,10 @@ class Ia32
 	end
 
 	def initialize_emudbg(dbg)
-		stack = EncodedData.new("\x00" * 0x10000)
-		stack_addr = 0x10000
-		stack_addr += 0x10000 while dbg.disassembler.get_section_at(stack_addr)
-		dbg.disassembler.add_section(stack, stack_addr)
-		dbg.set_reg_value(dbg_register_list[7], stack_addr + 0xf000)
+		if !dbg.is_symdbg
+			stack_addr = dbg.allocate_memory(0x10000)
+			dbg.set_reg_value(dbg_register_list[7], stack_addr + 0xf000)
+		end
 	end
 end
 end

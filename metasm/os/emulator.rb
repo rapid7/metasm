@@ -14,7 +14,7 @@ class VirtualMemoryDasm < VirtualString
 
 	def initialize(disassembler, addr_start = 0, length = nil)
 		@disassembler = disassembler
-		length ||= disassembler.sections.map { |k, v| k.kind_of?(Integer) ? k + v.length : 0 }.max
+		length ||= 1 << disassembler.cpu.size
 		super(addr_start, length)
 	end
 
@@ -47,7 +47,7 @@ class VirtualMemoryDasm < VirtualString
 	end
 end
 
-# this class implements a virtual debugger over an emulated cpu (based on cpu#get_backtrace_binding)
+# Virtual debugger running emulated cpu instructions (based on cpu#get_backtrace_binding)
 class EmuDebugger < Debugger
 	attr_accessor :ctx
 	# lambda called everytime we emulate a di
@@ -65,6 +65,7 @@ class EmuDebugger < Debugger
 	end
 
 	def shortname; 'emudbg'; end
+	def is_symdbg; false; end
 
 	def attach(disassembler)
 		@memory = VirtualMemoryDasm.new(disassembler)
@@ -78,7 +79,18 @@ class EmuDebugger < Debugger
 		@breakpoint = {}
 		@breakpoint_memory = {}
 		@breakpoint_thread = {}
+		make_sections_editable
 		@cpu.initialize_emudbg(self) if @cpu.respond_to?(:initialize_emudbg)
+	end
+
+	def make_sections_editable
+		# load dasm sections content as strings to allow nonpersistant modifications (would raise with a readonly VirtualFile object)
+		@disassembler.sections.each_value { |edata|
+		      if edata.length < 1024*1024
+			      edata.data = edata.data.to_str
+			      edata.fill
+		      end
+		}
 	end
 
 	def detach
@@ -98,7 +110,8 @@ class EmuDebugger < Debugger
 	end
 
 	def get_reg_value(r)
-		if r.to_s =~ /flags?_(.+)/i
+		case r.to_s
+		when /flags?_(.+)/i
 			f = $1.downcase.to_sym
 			get_flag_value(f)
 		else
@@ -107,10 +120,14 @@ class EmuDebugger < Debugger
 	end
 
 	def set_reg_value(r, v)
-		if r.to_s =~ /flags?_(.+)/i
+		case r.to_s
+		when /flags?_(.+)/i
 			f = $1.downcase.to_sym
 			set_flag_value(f, v)
 		else
+			if sz = @cpu.dbg_register_size[r]
+				v &= (1 << sz) - 1
+			end
 			@ctx[r] = v
 		end
 	end
@@ -121,6 +138,11 @@ class EmuDebugger < Debugger
 
 	def do_wait_target
 		true
+	end
+
+	def check_pre_run(m, *a)
+		@run_method = m
+		@run_args = a
 	end
 
 	def do_continue
@@ -135,6 +157,10 @@ class EmuDebugger < Debugger
 	end
 
 	def do_singlestep
+		if b = @breakpoint[pc]
+			evt_bpx(b)
+		end
+
 		di = @disassembler.di_at(pc)
 		if not di
 			@disassembler.disassemble_fast(pc)
@@ -154,9 +180,15 @@ class EmuDebugger < Debugger
 
 		return if di.opcode.props[:stopexec] and not di.opcode.props[:setip]
 
-		# 2-pass to respect binding atomicity
 		fbd = @disassembler.get_fwdemu_binding(di, register_pc, self)
 
+		do_singlestep_emu(di, fbd)
+
+		true
+	end
+
+	def do_singlestep_emu(di, fbd)
+		# 2-pass to respect binding atomicity
 		fbd.map { |k, v|
 			if k.kind_of?(Indirection)
 				k = Indirection.new(resolve(k.pointer), k.len, k.origin)
@@ -165,18 +197,185 @@ class EmuDebugger < Debugger
 		}.each { |k, v|
 			case k
 			when Indirection
-				raise "cannot assign value #{v}" if not v.kind_of?(::Integer)
-				v = v & ((1 << (k.len*8)) - 1)
-				memory_write_int(k.pointer, v, k.len)
+				if not k.pointer.kind_of?(::Integer)
+					raise "cannot assign to pointer #{k.pointer}"
+				elsif not v.kind_of?(::Integer)
+					raise "cannot assign value #{v}"
+				else
+					v = v & ((1 << (k.len*8)) - 1)
+					memory_write_int(k.pointer, v, k.len)
+				end
 			when Symbol
-				raise "cannot assign value #{v}" if not v.kind_of?(::Integer)
+				raise "cannot assign value #{k}=#{v}" if not v.kind_of?(::Integer)
 				set_reg_value(k, v)
 			when /^dummy_metasm_/
 			else
 				puts "singlestep: badkey #{k.inspect} = #{v}"
 			end
 		}
-		true
+	end
+
+	# allocate a new large memory zone, return the allocation address
+	def allocate_memory(len, addr=nil, raw=nil)
+		raw ||= EncodedData.new("\x00" * len)
+		if !addr
+			addr = 0x10000
+			addr += 0x10000 while @disassembler.get_section_at(addr)
+		end
+		@disassembler.add_section(raw, addr)
+		addr
+	end
+end
+
+# Same as EmuDebugger, but allows symbolic context (abstract values for registers and memory pointers, represented as symbols)
+class SymEmuDebugger < EmuDebugger
+	# hash { symbolic_addr => value }
+	attr_accessor :symbolic_memory
+
+	def shortname; 'symemudbg'; end
+	def is_symdbg; true; end
+
+	def attach(*a)
+		@symbolic_memory = {}
+		super(*a)
+	end
+
+	# initial value for registers
+	# general registers are initialized to :init_<reg>, others to 0
+	# eg :eax => :init_eax, :dr6 => 0, :eflags => 0
+	attr_accessor :default_reg_value
+	def get_default_reg_value
+		@default_reg_value ||= Hash.new(0).update @cpu.dbg_register_list.inject({}) { |h, r| ir = "init_#{r}".to_sym ; h.update r => ir, ir => ir }
+	end
+
+	def get_reg_value(r)
+		case r.to_s
+		when /flags?_(.+)/i
+			f = $1.downcase.to_sym
+			get_flag_value(f)
+		else
+			@ctx[r] || get_default_reg_value[r]
+		end
+	end
+
+	def set_reg_value(r, v)
+		case r.to_s
+		when /flags?_(.+)/i
+			f = $1.downcase.to_sym
+			set_flag_value(f, v)
+		else
+			if v.kind_of?(::Integer) and sz = @cpu.dbg_register_size[r]
+				v &= (1 << sz) - 1
+			end
+			@ctx[r] = v
+		end
+	end
+
+	def do_singlestep_emu(di, fbd)
+		# 2-pass to respect binding atomicity
+		fbd.map { |k, v|
+			if k.kind_of?(Indirection)
+				k = Indirection.new(resolve(k.pointer), k.len, k.origin)
+			end
+			[k, resolve(v)]
+		}.each { |k, v|
+			case k
+			when Indirection
+				v = v & ((1 << (k.len*8)) - 1) if v.kind_of?(::Integer)
+				memory_write_int(k.pointer, v, k.len)
+			when Symbol
+				set_reg_value(k, v)
+			when /^dummy_metasm_/
+			else
+				puts "singlestep: badkey #{k.inspect} = #{v}"
+			end
+		}
+	end
+
+	# handle symbolic_memory indirections
+	def resolve_expr(e)
+		case v = super(e)
+		when Expression
+			v.reduce { |i|
+				next if not i.kind_of?(Indirection)
+				next if not (0...i.len).find { |off| @symbolic_memory[i.pointer+off] }
+				memory_read_int(i.pointer, i.len || @cpu.size/8)
+			}
+		else
+			v
+		end
+	end
+
+	# read a concrete buffer from memory
+	# chop uninitialized memory at the end of the read buffer
+	# symbolic or uninitialized bytes read as 0
+	def memory_read(addr, len)
+		addr = resolve_expr(addr) if not addr.kind_of?(::Integer)
+		bytes = memory_read_bytes(addr, len)
+		bytes.pop while bytes.length > 0 and !bytes.last
+		bytes.map { |b| b.kind_of?(::Integer) ? b : 0 }.pack('C*')
+	end
+
+	# read an integer from memory
+	def memory_read_int(addr, sz=@cpu.size/8)
+		addr = resolve_expr(addr) if not addr.kind_of?(::Integer)
+		Expression.decode_sym(memory_read_bytes(addr, sz).map { |b| b || 0 }, sz, @cpu)
+	end
+
+	# return a byte array from memory
+	# may include symbolic values, or nil for uninitialized memory
+	def memory_read_bytes(ptr, len)
+		if ptr.kind_of?(::Integer)
+			bytes = @memory[ptr, len].unpack('C*')
+		else
+			bytes = []
+		end
+		(0...len).map { |i| @symbolic_memory[ptr+i] || bytes[i] }
+	end
+
+	# write a concrete buffer to memory
+	def memory_write(addr, len, value)
+		memory_write_bytes(addr, len, value.unpack('C*'))
+	end
+
+	# write an integer value to memory
+	def memory_write_int(addr, val, len=@cpu.size/8)
+		memory_write_bytes(addr, len, Expression.encode_sym(val, len, @cpu))
+	end
+
+	# write bytes to memory
+	# concrete values for concrete addresses update @memory, others update @symbolic_memory
+	def memory_write_bytes(ptr, len, bytes)
+		(0...len).each { |i|
+			v = bytes[i]
+			if ptr.kind_of?(::Integer) and v.kind_of?(::Integer)
+				@symbolic_memory.delete ptr+i
+				@memory[ptr+i, 1] = [v].pack('C*')
+			else
+				@symbolic_memory[ptr+i] = v
+			end
+		}
+		bytes
+	end
+
+	# return the current value of the registers expressed from the values of the registers at the beginning of the emulation
+	# eg 'inc eax' => { :eax => Expression[:eax+1] }
+	def get_regs_changed
+		out = {}
+		@ctx.each { |k, v|
+			nv = Expression[v].reduce { |e|
+				case e
+				when Symbol
+					# :init_eax => :eax
+					e.to_s[5..-1].to_sym if e.to_s[0, 5] == 'init_'
+				when Expression
+					# :eax & 0xffffffff => :eax
+					e.lexpr if e.op == :& and e.lexpr.kind_of?(::Symbol) and sz = @cpu.dbg_register_size[e.lexpr] and e.rexpr == (1 << sz) - 1
+				end
+			}
+			out[k] = nv if nv != Expression[k]
+		}
+		out
 	end
 end
 end

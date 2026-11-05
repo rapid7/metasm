@@ -356,11 +356,13 @@ class DisasmWidget < ContainerChoiceWidget
 	end
 
 	def list_sections
-		list = [['addr', 'length', 'name', 'info']]
+		list = [['addr', 'length', 'name', 'fileoff', 'info']]
 		@dasm.section_info.each { |n,a,l,i|
-			list << [Expression[a], Expression[l], n, i]
+			ra = @dasm.addr_to_fileoff(a)
+			ra = Expression[ra] if ra
+			list << [Expression[a], Expression[l], n, ra, i]
 		}
-		listwindow("list of sections", list) { |i| focus_addr i[0] if i[0] != '0' or @dasm.get_section_at(0) }
+		listwindow("list of sections", list) { |i| focus_addr_autocomplete i[0] if i[0] != '0' or @dasm.get_section_at(0) }
 	end
 
 	def list_strings
@@ -368,7 +370,7 @@ class DisasmWidget < ContainerChoiceWidget
 		@dasm.strings_scan { |o, str|
 			list << [Expression[o], str[0, 24].inspect, str.length]
 		}
-		listwindow("list of strings", list) { |i| focus_addr i[0] }
+		listwindow("list of strings", list) { |i| focus_addr_autocomplete i[0] }
 	end
 
 	def list_xrefs(addr=nil)
@@ -399,14 +401,14 @@ class DisasmWidget < ContainerChoiceWidget
 		if list.length == 1
 			messagebox "no xref to #{Expression[addr]}" if addr
 		else
-			listwindow("list of xrefs to #{Expression[addr]}", list) { |i| focus_addr(i[0], nil, true) }
+			listwindow("list of xrefs to #{Expression[addr]}", list) { |i| focus_addr_autocomplete i[0] }
 		end
 	end
 
 	# jump to address
 	def prompt_goto
 		inputbox('address to go', :text => Expression[curaddr]) { |v|
-			focus_addr_autocomplete(v)
+			focus_addr_autocomplete v, true
 		}
 	end
 
@@ -449,13 +451,13 @@ class DisasmWidget < ContainerChoiceWidget
 			}
 			list_bghilight("backtrace #{expr} from #{Expression[addr]}", list, :bghilight_index => 1) { |i|
 				a = i[1].empty? ? i[3] : i[1]
-				focus_addr(a, nil, true)
+				focus_addr_autocomplete a
 			}
 		}
 	end
 
 	# prompt the contant to use in place of some numeric value
-	def prompt_constant(di=curobj)
+	def prompt_constant(di=curobj, mask=0xffffffff)
 		return if not di.kind_of?(DecodedInstruction)
 		di.each_expr { |e|
 			next unless e.kind_of?(Expression)
@@ -463,7 +465,7 @@ class DisasmWidget < ContainerChoiceWidget
 					(!curview.hl_word or curview.hl_word == Expression[e.lexpr].to_s)
 				v = Expression[e.lexpr].reduce
 				lst = []
-				dasm.c_constants.each { |cn, cv, fm| lst << [cn, fm] if v == cv }
+				dasm.c_constants.each { |cn, cv, fm| lst << [cn, fm] if v & mask == cv & mask }
 				if not lst.empty?
 					default = Expression[v].to_s
 					lst << [default]
@@ -482,7 +484,7 @@ class DisasmWidget < ContainerChoiceWidget
 					(!curview.hl_word or curview.hl_word == Expression[e.rexpr].to_s)
 				v = Expression[e.rexpr].reduce
 				lst = []
-				dasm.c_constants.each { |cn, cv, fm| lst << [cn, fm] if v == cv }
+				dasm.c_constants.each { |cn, cv, fm| lst << [cn, fm] if v & mask == cv & mask }
 				if not lst.empty?
 					default = Expression[v].to_s
 					lst << [default]
@@ -555,7 +557,7 @@ class DisasmWidget < ContainerChoiceWidget
 
 	# same as focus_addr, also understands partial label names
 	# if the partial part is ambiguous, show a listwindow with all matches (if show_alt)
-	def focus_addr_autocomplete(v, show_alt=true)
+	def focus_addr_autocomplete(v, show_alt=false)
 		if not focus_addr(v, nil, true)
 			labels = @dasm.prog_binding.map { |k, vv|
 				[k, Expression[@dasm.normalize(vv)]] if k.downcase.include? v.downcase
@@ -771,7 +773,6 @@ class DisasmWidget < ContainerChoiceWidget
 		when ?m; prompt_constant(curobj)
 		when ?n; rename
 		when ?o; toggle_expr_offset(curobj)
-		when ?p; playpause_dasm
 		when ?r; toggle_expr_char(curobj)
 		when ?t; prompt_struct_ptr
 		when ?v; $VERBOSE = ! $VERBOSE ; puts "#{'not ' if not $VERBOSE}verbose"	# toggle verbose flag
@@ -855,6 +856,12 @@ class DisasmWidget < ContainerChoiceWidget
 
 	def spawn_emudbg
 		edbg = EmuDebugger.new(@dasm)
+		edbg.pc = curaddr
+		DbgWindow.new(edbg)
+	end
+
+	def spawn_symemudbg
+		edbg = SymEmuDebugger.new(@dasm)
 		edbg.pc = curaddr
 		DbgWindow.new(edbg)
 	end
@@ -1041,7 +1048,6 @@ class DasmWindow < Window
 	end
 
 	def build_menu
-		# TODO dynamic checkboxes (check $VERBOSE when opening the options menu to (un)set the mark)
 		filemenu = new_menu
 
 		# a fake unreferenced accel group, so that the shortcut keys appear in the menu, but the widget keypress is responsible
@@ -1106,8 +1112,8 @@ class DasmWindow < Window
 		actions = new_menu
 		dasm = new_menu
 		addsubmenu(dasm, '_Disassemble from here', 'c') { @dasm_widget.disassemble(@dasm_widget.curview.current_address) }
-		addsubmenu(dasm, 'Disassemble _fast from here', 'C') { @dasm_widget.disassemble_fast(@dasm_widget.curview.current_address) }
-		addsubmenu(dasm, 'Disassemble fast & dee_p from here', '^C') { @dasm_widget.disassemble_fast_deep(@dasm_widget.curview.current_address) }
+		addsubmenu(dasm, 'Disass_emble fast from here', 'C') { @dasm_widget.disassemble_fast(@dasm_widget.curview.current_address) }
+		addsubmenu(dasm, 'Disassemble _fast & deep from here', '^C') { @dasm_widget.disassemble_fast_deep(@dasm_widget.curview.current_address) }
 		addsubmenu(actions, dasm, '_Disassemble')
 		navigate = new_menu
 		addsubmenu(navigate, 'Follow', '<enter>') { @dasm_widget.focus_addr @dasm_widget.curview.hl_word }	# XXX
@@ -1126,13 +1132,14 @@ class DasmWindow < Window
 		addsubmenu(actions, 'Decompile finali_ze') { @dasm_widget.dasm.decompiler.finalize ; @dasm_widget.gui_update }
 		addsubmenu(actions, 'Comment', ';') { @dasm_widget.add_comment(@dasm_widget.curview.current_address) }
 		addsubmenu(actions, '_Undefine') { @dasm_widget.dasm.undefine_from(@dasm_widget.curview.current_address) ; @dasm_widget.gui_update }
-		addsubmenu(actions, 'Unde_fine function') { @dasm_widget.undefine_function(@dasm_widget.curview.current_address) }
-		addsubmenu(actions, 'Undefine function & _subfuncs') { @dasm_widget.undefine_function(@dasm_widget.curview.current_address, true) }
+		addsubmenu(actions, 'Undefine function') { @dasm_widget.undefine_function(@dasm_widget.curview.current_address) }
+		addsubmenu(actions, 'Undefine function & subfuncs') { @dasm_widget.undefine_function(@dasm_widget.curview.current_address, true) }
 		addsubmenu(actions, 'Data', 'd') { @dasm_widget.toggle_data(@dasm_widget.curview.current_address) }
-		addsubmenu(actions, 'Pause dasm', 'p', :check) { |ck| !@dasm_widget.playpause_dasm }
-		addsubmenu(actions, 'Spawn EmuDb_g', 'G') { @dasm_widget.spawn_emudbg }
-		addsubmenu(actions, 'Run ruby snippet', '^r') { promptruby }
-		addsubmenu(actions, 'Run _ruby plugin') { @dasm_widget.prompt_run_ruby_plugin }
+		addsubmenu(actions, '_Pause dasm', :check) { |ck| !@dasm_widget.playpause_dasm }
+		addsubmenu(actions, 'Spawn EmuDb_g') { @dasm_widget.spawn_emudbg }
+		addsubmenu(actions, 'Spawn _SymEmuDbg') { @dasm_widget.spawn_symemudbg }
+		addsubmenu(actions, 'Run _ruby snippet', '^r') { promptruby }
+		addsubmenu(actions, 'Run ruby plugin') { @dasm_widget.prompt_run_ruby_plugin }
 
 		addsubmenu(@menu, actions, '_Actions')
 

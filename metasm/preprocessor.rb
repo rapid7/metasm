@@ -37,7 +37,7 @@ class Preprocessor
 		def initialize(backtrace)
 			@backtrace = backtrace
 			@value = nil
-			@raw = ''
+			@raw = +''
 		end
 
 		# used when doing 'raise tok, "foo"'
@@ -715,8 +715,7 @@ class Preprocessor
 	def readtok_nopp_str(tok, delimiter)
 		tok.type = :quoted
 		tok.raw << delimiter
-		tok.value = ''
-		tok.value.force_encoding('binary') if tok.value.respond_to?(:force_encoding)
+		tok.value = ''.b
 		c = nil
 		loop do
 			raise tok, 'unterminated string' if not c = getchar

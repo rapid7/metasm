@@ -10,7 +10,8 @@ module Metasm
 class ExeFormat
 	# encodes an Array of source (Label/Data/Instruction etc) to an EncodedData
 	# resolves ambiguities using +encode_resolve+
-	def assemble_sequence(seq, cpu)
+	# uses optional ext_binding to find shortest encoding for instructions
+	def assemble_sequence(seq, cpu, ext_binding={}, startlabel=nil)
 		# an array of edata or sub-array of ambiguous edata
 		# its last element is always an edata
 		ary = [EncodedData.new]
@@ -37,26 +38,29 @@ class ExeFormat
 			end
 		}
 
-		edata = (ary.length > 1) ? assemble_resolve(ary) : ary.shift
+		edata = (ary.length > 1) ? assemble_resolve(ary, ext_binding, startlabel) : ary.shift
 		edata.fixup edata.binding
 		edata
 	end
 
 	# choose among multiple possible sub-EncodedData
-	# assumes all ambiguous edata have the equivallent relocations in the same order
-	def assemble_resolve(ary)
-		startlabel = new_label('section_start')
+	# assumes all ambiguous edata have equivalent relocations in the same order
+	# use ext_binding to select size-optimal encoding of instructions with relocs
+	# startlabel is the label/address of the beginning of the section, others internal exports
+	#  are redefined as offsets from that
+	def assemble_resolve(ary, ext_binding={}, startlabel=nil)
+		startlabel ||= new_label('section_start')
 
 		# create two bindings where all elements are the shortest/longest possible
-		minbinding = {}
+		minbinding = ext_binding.dup
 		minoff = 0
-		maxbinding = {}
+		maxbinding = ext_binding.dup
 		maxoff = 0
 
 		ary.each { |elem|
 			case elem
 			when Array
-				if elem.all? { |ed| ed.kind_of? EncodedData and ed.reloc.empty? }
+				if elem.all? { |ed| ed.kind_of?(EncodedData) and ed.reloc.empty? }
 					elem = [elem.sort_by { |ed| ed.length }.first]
 				end
 				elem.each { |e|
@@ -186,8 +190,7 @@ class ExeFormat
 				wantsize = {}
 
 				elem.each { |e|
-					e.reloc.sort.each_with_index { |r_, i|
-						r = r_[1]
+					e.reloc.sort.each_with_index { |(_, r), i|
 						# has external ref
 						if not r.target.bind(minbinding).reduce.kind_of?(Numeric) or not check_linear[r.target]
 							# find the biggest relocation type for the current target
@@ -214,14 +217,9 @@ class ExeFormat
 
 				raise EncodeError, "cannot find candidate in #{elem.inspect}, immediate too big #{wantsize.inspect} #{target_bounds.inspect}" if acceptable.empty?
 
-				# keep the shortest, use a hack make sort consistent in all cases
-				# see https://8thlight.com/blog/will-warner/2013/03/26/stable-sorting-in-ruby.html
-				n = 0
-				mod_map = acceptable.map { |edata| n += 1 ; [[edata.virtsize, n], edata] }
-				interm_sort = mod_map.sort { |left, right| left[0] <=> right[0] }
-				mod_sort_result = interm_sort.collect { |edata| edata[1] }
-				result = mod_sort_result.first
-				result
+				# keep the shortest
+				minsz = acceptable.map { |edata| edata.virtsize }.min
+				acceptable.find { |edata| edata.virtsize == minsz }
 			else
 				elem
 			end
@@ -279,13 +277,12 @@ class Expression
 		when Integer; EncodedData.new Expression.encode_imm(val, type, endianness, backtrace)
 		else
 			str = case INT_SIZE[type]
-			      when  8; "\0"
-			      when 16; "\0\0"
-			      when 32; "\0\0\0\0"
-			      when 64; "\0\0\0\0\0\0\0\0"
+			      when  8; "\0".b
+			      when 16; "\0\0".b
+			      when 32; "\0\0\0\0".b
+			      when 64; "\0\0\0\0\0\0\0\0".b
 			      else [0].pack('C')*(INT_SIZE[type]/8)
 			      end
-			str = str.force_encoding('BINARY') if str.respond_to?(:force_encoding)
 			EncodedData.new(str, :reloc => {0 => Relocation.new(self, type, endianness, backtrace)})
 		end
 	end
@@ -311,6 +308,14 @@ class Expression
 		endianness != :little ? s.reverse : s
 	end
 	alias encode_immediate encode_imm
+
+	# encode an Expression as an array of byte values
+	def encode_sym(val, type, endianness)
+		type = INT_SIZE.keys.find { |k| k.to_s[0] == ?a and INT_SIZE[k] == 8*type } if type.kind_of? ::Integer
+		endianness = endianness.endianness if not endianness.kind_of? ::Symbol
+		s = (0...INT_SIZE[type]/8).map { |i| Expression[[val, :>>, 8*i], :&, 0xff].reduce }
+		endianness != :little ? s.reverse : s
+	end
 	end
 end
 

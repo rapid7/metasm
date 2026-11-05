@@ -102,6 +102,25 @@ extern VALUE *rb_eArgError __attribute__((import));
  #define STR_LEN(o) (RString(o)->len)
  #define ARY_PTR(o) (RArray(o)->ptr)
  #define ARY_LEN(o) (RArray(o)->len)
+#else
+ #define T_STRING 0x05
+ #define T_ARRAY  0x07
+ #define T_FIXNUM 0x15
+ #define T_MASK   0x1f
+ #define RSTRING_NOEMBED (1<<13)
+#if #{RUBY_VERSION >= '3.2' ? 0 : 1}
+ // ruby1.9 .. 3.2
+ #define STR_PTR(o) ((RString(o)->flags & RSTRING_NOEMBED) ? RString(o)->ptr : (char*)&RString(o)->len)
+ #define STR_LEN(o) ((RString(o)->flags & RSTRING_NOEMBED) ? RString(o)->len : (RString(o)->flags >> 14) & 0x1f)
+#else
+ // ruby3.2+: len is used for NOEMBED strings, and the str buffer starts right after len (off 8+8+4 on win64, usually, do a dynamic validation
+ #define STR_PTR(o) ((RString(o)->flags & RSTRING_NOEMBED) ? RString(o)->ptr : (((char*)o) + x_str_ptr_off))
+ #define STR_LEN(o) RString(o)->len
+#endif
+ #define RARRAY_EMBED (1<<13)
+ #define ARY_PTR(o) ((RArray(o)->flags & RARRAY_EMBED) ? (VALUE*)&RArray(o)->len : RArray(o)->ptr)
+ // RVARGC uses more bits, should be 0/unused in earlier ruby versions
+ #define ARY_LEN(o) ((RArray(o)->flags & RARRAY_EMBED) ? ((RArray(o)->flags >> 15) & 0xff) : RArray(o)->len)
 #endif
 
 #if #{nil.object_id == 4 ? 1 : 0}
@@ -163,7 +182,14 @@ extern void *callback_id_0;
 extern void *callback_id_1;
 
 static VALUE dynldr;
+static uintptr_t x_str_ptr_off = sizeof(VALUE)+sizeof(VALUE)+sizeof(long);
 
+// define the internal offset to find an inline string buffer
+static VALUE set_x_str_ptr_off(VALUE self, VALUE newoff)
+{
+	x_str_ptr_off = VAL2INT(newoff);
+	return newoff;
+}
 
 static VALUE memory_read(VALUE self, VALUE addr, VALUE len)
 {
@@ -199,6 +225,11 @@ static VALUE str_ptr(VALUE self, VALUE str)
 	if (TYPE(str) != T_STRING)
 		rb_raise(*rb_eArgError, "Invalid ptr");
 	return INT2VAL((uintptr_t)STR_PTR(str));
+}
+
+static VALUE value_ptr(VALUE self, VALUE val)
+{
+	return INT2VAL((uintptr_t)val);
 }
 
 // return the VALUE of an object (different of .object_id for Symbols, maybe others)
@@ -376,11 +407,13 @@ uintptr_t do_callback_handler(uintptr_t cb_id __attribute__((register(rax))),
 int Init_dynldr(void) __attribute__((export_as(Init_<insertfilenamehere>)))	// to patch before parsing to match the .so name
 {
 	dynldr = rb_const_get(rb_const_get(*rb_cObject, rb_intern("Metasm")), rb_intern("DynLdr"));
+	rb_define_singleton_method(dynldr, "set_x_str_ptr_off",  set_x_str_ptr_off, 1);
 	rb_define_singleton_method(dynldr, "memory_read",  memory_read, 2);
 	rb_define_singleton_method(dynldr, "memory_read_int",  memory_read_int, 1);
 	rb_define_singleton_method(dynldr, "memory_write", memory_write, 2);
 	rb_define_singleton_method(dynldr, "memory_write_int", memory_write_int, 2);
 	rb_define_singleton_method(dynldr, "str_ptr", str_ptr, 1);
+	rb_define_singleton_method(dynldr, "value_ptr", value_ptr, 1);
 	rb_define_singleton_method(dynldr, "rb_obj_to_value", rb_obj_to_value, 1);
 	rb_define_singleton_method(dynldr, "rb_value_to_obj", rb_value_to_obj, 1);
 	rb_define_singleton_method(dynldr, "sym_addr", sym_addr, 2);
@@ -636,6 +669,16 @@ EOS
 		require binmodule
 
 		@@callback_addrs << CALLBACK_ID_0 << CALLBACK_ID_1
+
+		# ruby 3.4.2 windows may have specific str_ptr embed offset
+		teststr = 'foo'.freeze
+		if memory_read(str_ptr(teststr), 3) != 'foo'
+			raw = memory_read(value_ptr(teststr), 8*5)
+			off = raw.index('foo')
+			raise 'cannot str_ptr' if not off
+			set_x_str_ptr_off(off)
+			raise 'failed str_ptr' if memory_read(str_ptr(teststr), 3) != 'foo'
+		end
 	end
 
 	# compile the dynldr binary ruby module for a specific arch/cpu/modulename
